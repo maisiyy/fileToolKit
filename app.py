@@ -6,6 +6,9 @@ Features:
   2. Convert video to MP3
   3. Convert image type (png, jpg, webp, bmp, gif, tiff) and images to PDF
   4. Convert PDF pages to images (png / jpg)
+  5. Rotate, reorder and delete PDF pages
+  6. Convert a video clip to an animated GIF
+  7. Download the audio of a YouTube link (mp3 / m4a / wav / flac)
 
 Run with:  python app.py
 """
@@ -20,7 +23,8 @@ import customtkinter as ctk                # modern-looking widgets on top of tk
 import pymupdf                             # render PDF pages to images
 import imageio_ffmpeg                      # gives us the path to ffmpeg
 from PIL import Image                      # Pillow: open and save images
-from pypdf import PdfWriter                # build a new PDF
+from pypdf import PdfReader, PdfWriter     # PdfReader opens a PDF, PdfWriter builds a new one
+import yt_dlp                              # downloads audio/video from YouTube and similar sites
 
 # ---------- look and feel ----------
 ctk.set_appearance_mode("dark")            # "dark", "light" or "system"
@@ -102,6 +106,90 @@ def pdf_to_images(pdf_path, output_folder, image_format="png", zoom=2.0):
     count = len(doc)
     doc.close()
     return count
+
+
+def make_page_thumbnails(pdf_path, max_size=(56, 72)):
+    """Return a small PIL image for every page of a PDF (used by the page editor)."""
+    doc = pymupdf.open(pdf_path)
+    thumbs = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(0.3, 0.3))     # draw the page small
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        img.thumbnail(max_size)                                    # shrink to fit the box
+        thumbs.append(img)
+    doc.close()
+    return thumbs
+
+
+def edit_pdf_pages(pdf_path, output_path, pages):
+    """Build a new PDF from `pages`, a list of (original_page_index, extra_rotation_degrees).
+
+    The ORDER of the list is the new page order. Pages not in the list are deleted.
+    """
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
+    for index, rotation in pages:
+        page = reader.pages[index]
+        if rotation:
+            page.rotate(rotation)          # adds to any rotation the page already has
+        writer.add_page(page)
+    with open(output_path, "wb") as f:
+        writer.write(f)
+    writer.close()
+
+
+def video_to_gif(video_path, output_path, fps=12, width=480, start=0.0, duration=5.0):
+    """Turn a part of a video into an animated GIF."""
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    # GIFs only have 256 colours. These two filters first work out the best 256 colours
+    # for this clip (palettegen) and then use them (paletteuse), which looks much better.
+    filters = (f"fps={fps},scale={width}:-1:flags=lanczos,"
+               "split[a][b];[a]palettegen[p];[b][p]paletteuse")
+    command = [
+        ffmpeg, "-y",
+        "-ss", str(start),         # where to start, in seconds
+        "-t", str(duration),       # how many seconds to keep
+        "-i", video_path,
+        "-vf", filters,
+        "-loop", "0",              # 0 = repeat forever
+        output_path,
+    ]
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(command, capture_output=True, text=True, creationflags=flags)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-500:] or "ffmpeg failed")
+
+
+def youtube_to_audio(url, output_folder, audio_format="mp3", on_progress=None):
+    """Download the audio of one YouTube video and convert it. Returns the video title."""
+    def hook(d):                           # yt-dlp calls this while it downloads
+        if on_progress and d.get("status") == "downloading":
+            on_progress("Downloading... " + d.get("_percent_str", "").strip())
+
+    def pp_hook(d):                        # ...and this when it starts converting the audio
+        if on_progress and d.get("status") == "started":
+            on_progress(f"Converting to {audio_format}...")
+
+    options = {
+        "format": "bestaudio/best",                            # best audio-only stream
+        "outtmpl": os.path.join(output_folder, "%(title)s.%(ext)s"),   # file name = video title
+        "windowsfilenames": True,                              # remove characters Windows dislikes
+        "noplaylist": True,                                    # a playlist link = only that one video
+        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),    # use our bundled ffmpeg
+        "progress_hooks": [hook],
+        "postprocessor_hooks": [pp_hook],
+        "quiet": True,
+        "noprogress": True,                                    # no text progress bar (there is no console)
+        "no_warnings": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",                       # convert the download to audio
+            "preferredcodec": audio_format,
+            "preferredquality": "192",                         # 192 kbps (ignored for wav/flac)
+        }],
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+    return info.get("title", "audio")
 
 
 # ----------------------------------------------------------------------
@@ -197,8 +285,8 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("File Toolkit")
-        self.geometry("880x600")
-        self.minsize(780, 560)
+        self.geometry("920x680")
+        self.minsize(820, 640)
 
         # column 0 = sidebar (fixed), column 1 = content (stretches)
         self.grid_columnconfigure(1, weight=1)
@@ -216,6 +304,9 @@ class App(ctk.CTk):
         self.add_page("Video to MP3", self.build_video_page)
         self.add_page("Image convert", self.build_image_page)
         self.add_page("PDF to images", self.build_pdf_page)
+        self.add_page("PDF pages", self.build_pages_page)
+        self.add_page("Video to GIF", self.build_gif_page)
+        self.add_page("YouTube audio", self.build_youtube_page)
         self.show_page("Merge PDF")
 
     # ---------- layout pieces ----------
@@ -441,6 +532,242 @@ class App(ctk.CTk):
         run_in_background(
             lambda: pdf_to_images(src, folder, fmt),
             lambda n: self.finished(f"Saved {n} page(s) into {folder}"),
+            self.failed, self)
+
+    # ---------- Page 5: PDF pages (rotate / reorder / delete) ----------
+    def build_pages_page(self, page):
+        self.header(page, "PDF pages", "Rotate, reorder or delete pages, then save a new PDF.")
+        card = ctk.CTkFrame(page, corner_radius=12)
+        card.pack(fill="x")
+        self.edit_pdf_path = tk.StringVar()
+        self.picker(card, self.edit_pdf_path, self.pick_edit_pdf)
+
+        info = ctk.CTkFrame(page, fg_color="transparent")        # row: page count + Reset
+        info.pack(fill="x", pady=(10, 0))
+        self.pages_info = ctk.CTkLabel(info, text="", text_color=MUTED)
+        self.pages_info.pack(side="left")
+        ctk.CTkButton(info, text="Reset", width=80, fg_color="transparent", border_width=1,
+                      text_color=TEXT, command=self.reset_pages).pack(side="right")
+
+        self.page_items = []        # one dict per page: {"orig": original index, "rot": degrees, "thumb": image}
+        self.image_cache = {}       # (orig, rot) -> CTkImage, so rows rebuild quickly
+        self.page_list = ctk.CTkScrollableFrame(page, height=150)
+        self.page_list.pack(fill="both", expand=True, pady=(6, 0))
+        self.refresh_pages()
+        self.action_button(page, "Save as new PDF", self.do_save_pages)
+
+    def pick_edit_pdf(self):
+        p = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
+        if not p:
+            return
+        self.edit_pdf_path.set(p)
+        self.busy("Loading pages...")
+        run_in_background(lambda: make_page_thumbnails(p), self.pages_loaded, self.failed, self)
+
+    def pages_loaded(self, thumbs):
+        self.loaded_thumbs = thumbs                 # kept so Reset can start over
+        self.reset_pages()
+        self.finished(f"Loaded {len(thumbs)} page(s)")
+
+    def reset_pages(self):
+        thumbs = getattr(self, "loaded_thumbs", [])
+        self.page_items = [{"orig": i, "rot": 0, "thumb": t} for i, t in enumerate(thumbs)]
+        self.image_cache.clear()
+        self.refresh_pages()
+
+    def page_image(self, item):
+        """The thumbnail for a page, turned by its current rotation."""
+        key = (item["orig"], item["rot"])
+        if key not in self.image_cache:
+            img = item["thumb"]
+            if item["rot"]:
+                img = img.rotate(-item["rot"], expand=True)   # PIL turns anticlockwise, so negate
+            self.image_cache[key] = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+        return self.image_cache[key]
+
+    def refresh_pages(self):
+        """Rebuild all the page rows from self.page_items."""
+        for child in self.page_list.winfo_children():
+            child.destroy()
+        self.pages_info.configure(text=f"{len(self.page_items)} page(s)")
+
+        if not self.page_items:
+            ctk.CTkLabel(self.page_list, text="Open a PDF to see its pages here.",
+                         text_color=MUTED).pack(pady=30)
+            return
+
+        for i, item in enumerate(self.page_items):
+            row = ctk.CTkFrame(self.page_list, corner_radius=8)
+            row.pack(fill="x", pady=3)
+            ctk.CTkLabel(row, text="", image=self.page_image(item),
+                         width=84, height=80).pack(side="left", padx=6, pady=4)
+            note = f"   (turned {item['rot']}°)" if item["rot"] else ""
+            ctk.CTkLabel(row, text=f"Page {i + 1}   ·   was page {item['orig'] + 1}{note}",
+                         anchor="w").pack(side="left", fill="x", expand=True)
+            # i=i freezes the current value of i for each button
+            ctk.CTkButton(row, text="✕", width=34, fg_color="transparent", text_color=TEXT,
+                          hover_color=("#F2B8B5", "#6B2B28"),
+                          command=lambda i=i: self.delete_page(i)).pack(side="right", padx=(0, 6))
+            ctk.CTkButton(row, text="↓", width=34, fg_color="transparent", text_color=TEXT,
+                          command=lambda i=i: self.move_page(i, 1)).pack(side="right")
+            ctk.CTkButton(row, text="↑", width=34, fg_color="transparent", text_color=TEXT,
+                          command=lambda i=i: self.move_page(i, -1)).pack(side="right")
+            ctk.CTkButton(row, text="↻", width=34, fg_color="transparent", text_color=TEXT,
+                          command=lambda i=i: self.rotate_page(i, 90)).pack(side="right")
+            ctk.CTkButton(row, text="↺", width=34, fg_color="transparent", text_color=TEXT,
+                          command=lambda i=i: self.rotate_page(i, -90)).pack(side="right")
+
+    def rotate_page(self, i, degrees):
+        item = self.page_items[i]
+        item["rot"] = (item["rot"] + degrees) % 360    # keeps it at 0, 90, 180 or 270
+        self.refresh_pages()
+
+    def move_page(self, i, step):
+        j = i + step                                   # -1 = up, +1 = down
+        if 0 <= j < len(self.page_items):
+            self.page_items[i], self.page_items[j] = self.page_items[j], self.page_items[i]
+            self.refresh_pages()
+
+    def delete_page(self, i):
+        del self.page_items[i]
+        self.refresh_pages()
+
+    def do_save_pages(self):
+        src = self.edit_pdf_path.get()
+        if not src or not self.page_items:
+            messagebox.showinfo("PDF pages", "Open a PDF and keep at least one page.")
+            return
+        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF", "*.pdf")])
+        if not out:
+            return
+        if os.path.abspath(out) == os.path.abspath(src):
+            messagebox.showinfo("PDF pages", "Save under a different name, so your original stays safe.")
+            return
+        pages = [(item["orig"], item["rot"]) for item in self.page_items]   # the new plan
+        self.busy("Saving PDF...")
+        run_in_background(
+            lambda: edit_pdf_pages(src, out, pages),
+            lambda _: self.finished(f"Saved {out}"),
+            self.failed, self)
+
+    # ---------- Page 6: Video to GIF ----------
+    def build_gif_page(self, page):
+        self.header(page, "Video to GIF", "Turn a short part of a video into an animated GIF.")
+        card = ctk.CTkFrame(page, corner_radius=12)
+        card.pack(fill="x")
+        self.gif_video = tk.StringVar()
+        self.picker(card, self.gif_video, self.pick_gif_video)
+
+        opts = ctk.CTkFrame(card, fg_color="transparent")
+        opts.pack(fill="x", padx=16, pady=(0, 8))
+        self.gif_start = tk.StringVar(value="0")
+        self.gif_length = tk.StringVar(value="5")
+        self.gif_width = tk.StringVar(value="480")
+        self.gif_fps = tk.StringVar(value="12")
+        # grid = rows and columns: (row, column) places each widget
+        ctk.CTkLabel(opts, text="Start at (seconds)").grid(row=0, column=0, sticky="w", pady=6)
+        ctk.CTkEntry(opts, textvariable=self.gif_start, width=90).grid(row=0, column=1, padx=(10, 40))
+        ctk.CTkLabel(opts, text="Length (seconds)").grid(row=0, column=2, sticky="w")
+        ctk.CTkEntry(opts, textvariable=self.gif_length, width=90).grid(row=0, column=3, padx=10)
+        ctk.CTkLabel(opts, text="Width (pixels)").grid(row=1, column=0, sticky="w", pady=6)
+        ctk.CTkOptionMenu(opts, values=["320", "480", "640", "800"], variable=self.gif_width,
+                          width=90).grid(row=1, column=1, padx=(10, 40))
+        ctk.CTkLabel(opts, text="Smoothness (fps)").grid(row=1, column=2, sticky="w")
+        ctk.CTkOptionMenu(opts, values=["8", "12", "15", "20"], variable=self.gif_fps,
+                          width=90).grid(row=1, column=3, padx=10)
+
+        ctk.CTkLabel(card, text="Tip: 3 to 8 seconds at 480 pixels keeps the GIF small. Max length is 30 seconds.",
+                     text_color=MUTED, anchor="w").pack(fill="x", padx=16, pady=(0, 14))
+        self.action_button(page, "Create GIF", self.do_gif)
+
+    def pick_gif_video(self):
+        p = filedialog.askopenfilename(filetypes=[
+            ("Video files", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.wmv"), ("All files", "*.*")])
+        if p:
+            self.gif_video.set(p)
+
+    def do_gif(self):
+        src = self.gif_video.get()
+        if not src:
+            messagebox.showinfo("Video to GIF", "Choose a video first.")
+            return
+        try:
+            start = float(self.gif_start.get())
+            length = float(self.gif_length.get())
+        except ValueError:                             # the user typed letters, not a number
+            messagebox.showinfo("Video to GIF", "Start and length must be numbers, like 0 and 5.")
+            return
+        if start < 0 or length <= 0 or length > 30:
+            messagebox.showinfo("Video to GIF", "Start must be 0 or more, and length between 0 and 30 seconds.")
+            return
+        width = int(self.gif_width.get())
+        fps = int(self.gif_fps.get())
+        default = os.path.splitext(os.path.basename(src))[0] + ".gif"
+        out = filedialog.asksaveasfilename(initialfile=default, defaultextension=".gif",
+                                           filetypes=[("GIF", "*.gif")])
+        if not out:
+            return
+        self.busy("Creating GIF...")
+        run_in_background(
+            lambda: video_to_gif(src, out, fps=fps, width=width, start=start, duration=length),
+            lambda _: self.finished(f"Saved {out}"),
+            self.failed, self)
+
+    # ---------- Page 7: YouTube audio ----------
+    def build_youtube_page(self, page):
+        self.header(page, "YouTube audio", "Paste a YouTube link and save its audio as a file.")
+        card = ctk.CTkFrame(page, corner_radius=12)
+        card.pack(fill="x")
+
+        # no textvariable here: CustomTkinter hides the placeholder text if one is attached
+        self.yt_entry = ctk.CTkEntry(card, height=38, placeholder_text="Paste a YouTube link here")
+        self.yt_entry.pack(fill="x", padx=16, pady=(16, 8))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkLabel(row, text="Format:").pack(side="left", padx=(0, 8))
+        self.yt_format = tk.StringVar(value="mp3")
+        ctk.CTkOptionMenu(row, values=["mp3", "m4a", "wav", "flac"], variable=self.yt_format,
+                          width=90).pack(side="left")
+
+        self.yt_folder = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
+        folder_row = ctk.CTkFrame(card, fg_color="transparent")
+        folder_row.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkLabel(folder_row, text="Save to:").pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(folder_row, textvariable=self.yt_folder).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(folder_row, text="Browse", width=100,
+                      command=self.pick_yt_folder).pack(side="left", padx=(10, 0))
+
+        ctk.CTkLabel(card, text="Only download videos you own or have permission to save. "
+                                "If downloads stop working, run: python -m pip install -U yt-dlp",
+                     text_color=MUTED, anchor="w", justify="left",
+                     wraplength=560).pack(fill="x", padx=16, pady=(0, 14))
+        self.action_button(page, "Download audio", self.do_youtube)
+
+    def pick_yt_folder(self):
+        p = filedialog.askdirectory(title="Choose where to save")
+        if p:
+            self.yt_folder.set(p)
+
+    def do_youtube(self):
+        url = self.yt_entry.get().strip()
+        if not url.startswith(("http://", "https://")):
+            messagebox.showinfo("YouTube audio", "Paste a full link that starts with https://")
+            return
+        folder = self.yt_folder.get().strip()
+        if not folder:
+            messagebox.showinfo("YouTube audio", "Choose a folder to save into.")
+            return
+        os.makedirs(folder, exist_ok=True)             # create the folder if it doesn't exist
+        fmt = self.yt_format.get()
+
+        def on_progress(message):                      # runs in the worker thread...
+            self.after(0, lambda: self.set_status(message, TEXT))   # ...so hand it to the window thread
+
+        self.busy("Starting download...")
+        run_in_background(
+            lambda: youtube_to_audio(url, folder, fmt, on_progress),
+            lambda title: self.finished(f"Saved '{title}' into {folder}"),
             self.failed, self)
 
 
